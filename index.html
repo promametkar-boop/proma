@@ -1,0 +1,1063 @@
+<!DOCTYPE html>
+<html lang="tr">
+
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>Proma Güvenlik – Arıza Takip Sistemi</title>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <link
+        href="https://fonts.googleapis.com/css2?family=Barlow+Condensed:wght@400;600;700;800&family=Barlow:wght@400;500;600&display=swap"
+        rel="stylesheet" />
+
+    <!-- ══════════════════════════════════════════════════
+       FIREBASE SDK
+  ══════════════════════════════════════════════════ -->
+    <script type="module">
+        // ── FIREBASE CONFIG ─────────────────────────────
+        // Aşağıdaki nesneyi kendi Firebase projenizin
+        // yapılandırmasıyla doldurun.
+        const firebaseConfig = {
+            apiKey: "AIzaSyBMAZJ_C-v_3jbT7r1r9nF-FGk1ffK1ZdE",
+            authDomain: "proma-2b874.firebaseapp.com",
+            projectId: "proma-2b874",
+            storageBucket: "proma-2b874.firebasestorage.app",
+            messagingSenderId: "699930157528",
+            appId: "1:699930157528:web:1a5d3d0c93e372d93a52ad",
+            measurementId: "G-RPL21E343X"
+        };
+        // ────────────────────────────────────────────────
+
+        import { initializeApp } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-app.js";
+        import {
+            getAuth, signInWithEmailAndPassword,
+            signOut, onAuthStateChanged
+        } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-auth.js";
+        import {
+            getFirestore, collection, addDoc,
+            getDocs, query, where, orderBy,
+            serverTimestamp, Timestamp
+        } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js";
+        import {
+            getStorage, ref, uploadBytes,
+            getDownloadURL
+        } from "https://www.gstatic.com/firebasejs/10.12.2/firebase-storage.js";
+
+        const app = initializeApp(firebaseConfig);
+        const auth = getAuth(app);
+        const db = getFirestore(app);
+        const storage = getStorage(app);
+
+        // ── ADMIN EMAIL ──────────────────────────────────
+        const ADMIN_EMAIL = "satis@promaguvenlik.com";
+
+        // ════════════════════════════════════════════════
+        //  STATE
+        // ════════════════════════════════════════════════
+        let currentUser = null;
+        let isAdmin = false;
+        let allRecords = [];
+        let filterStatus = "all";
+        let searchTerm = "";
+        let selectedPhotos = []; // {file, previewUrl}
+
+        // ── PHOTO HELPERS ────────────────────────────────
+        function handlePhotoSelect(e) {
+            const files = Array.from(e.target.files);
+            files.forEach(file => {
+                if (!file.type.startsWith("image/")) return;
+                if (selectedPhotos.length >= 5) { showToast("En fazla 5 fotoğraf eklenebilir.", "info"); return; }
+                const reader = new FileReader();
+                reader.onload = ev => {
+                    selectedPhotos.push({ file, previewUrl: ev.target.result });
+                    renderPhotoPreview();
+                };
+                reader.readAsDataURL(file);
+            });
+            e.target.value = ""; // tekrar aynı dosya seçilebilsin
+        }
+
+        function removePhoto(idx) {
+            selectedPhotos.splice(idx, 1);
+            renderPhotoPreview();
+        }
+
+        function renderPhotoPreview() {
+            const container = document.getElementById("photoPreview");
+            if (!container) return;
+            container.innerHTML = selectedPhotos.map((p, i) => `
+        <div class="relative group">
+          <img src="${p.previewUrl}" class="w-20 h-20 object-cover rounded-lg border border-gray-700 cursor-pointer"
+               onclick="openPhotoViewer('${p.previewUrl}')" title="Büyütmek için tıkla" />
+          <button type="button" onclick="removePhoto(${i})"
+                  class="absolute -top-2 -right-2 w-5 h-5 rounded-full bg-red-600 text-white text-xs flex items-center justify-center opacity-0 group-hover:opacity-100 transition-opacity leading-none">✕</button>
+        </div>
+      `).join("") + (selectedPhotos.length < 5 ? `
+        <label class="w-20 h-20 rounded-lg border-2 border-dashed border-gray-600 flex flex-col items-center justify-center cursor-pointer hover:border-red-500 transition-colors text-gray-500 hover:text-red-400">
+          <span class="text-2xl leading-none">+</span>
+          <span class="text-xs mt-1">Ekle</span>
+          <input type="file" accept="image/*" multiple class="hidden" onchange="handlePhotoSelect(event)" />
+        </label>` : "");
+        }
+
+        async function uploadPhotos(recordId) {
+            const urls = [];
+            for (const p of selectedPhotos) {
+                const storageRef = ref(storage, `arizalar/${recordId}/${Date.now()}_${p.file.name}`);
+                await uploadBytes(storageRef, p.file);
+                const url = await getDownloadURL(storageRef);
+                urls.push(url);
+            }
+            return urls;
+        }
+
+        function openPhotoViewer(url) {
+            const viewer = document.getElementById("photoViewer");
+            document.getElementById("photoViewerImg").src = url;
+            viewer.classList.remove("hidden");
+            viewer.style.display = "flex";
+        }
+        window.openPhotoViewer = openPhotoViewer;
+        window.removePhoto = removePhoto;
+        window.handlePhotoSelect = handlePhotoSelect;
+
+        // ════════════════════════════════════════════════
+        //  AUTH STATE
+        // ════════════════════════════════════════════════
+        onAuthStateChanged(auth, async (user) => {
+            if (user) {
+                currentUser = user;
+                isAdmin = user.email === ADMIN_EMAIL;
+                showDashboard();
+                await loadRecords();
+            } else {
+                currentUser = null;
+                isAdmin = false;
+                showLogin();
+            }
+        });
+
+        // ════════════════════════════════════════════════
+        //  LOGIN
+        // ════════════════════════════════════════════════
+        async function doLogin() {
+            const email = document.getElementById("loginEmail").value.trim();
+            const password = document.getElementById("loginPassword").value;
+            const remember = document.getElementById("rememberMe").checked;
+            const errEl = document.getElementById("loginError");
+            errEl.textContent = "";
+
+            // e-posta ve şifre hatırla
+            if (remember) {
+                localStorage.setItem("rememberedEmail", email);
+                localStorage.setItem("rememberedPassword", password);
+            } else {
+                localStorage.removeItem("rememberedEmail");
+                localStorage.removeItem("rememberedPassword");
+            }
+
+            try {
+                await signInWithEmailAndPassword(auth, email, password);
+            } catch (e) {
+                errEl.textContent = "Giriş başarısız: E-posta veya şifre hatalı.";
+            }
+        }
+
+        async function doLogout() {
+            await signOut(auth);
+        }
+
+        // ════════════════════════════════════════════════
+        //  RECORDS
+        // ════════════════════════════════════════════════
+        async function loadRecords() {
+            try {
+                let q;
+                if (isAdmin) {
+                    q = query(collection(db, "arizalar"), orderBy("tarih", "desc"));
+                } else {
+                    q = query(
+                        collection(db, "arizalar"),
+                        where("bayiEmail", "==", currentUser.email),
+                        orderBy("tarih", "desc")
+                    );
+                }
+                const snap = await getDocs(q);
+                allRecords = snap.docs.map(d => ({ id: d.id, ...d.data() }));
+                renderTable();
+            } catch (e) {
+                console.error("Kayıtlar yüklenemedi:", e);
+            }
+        }
+
+        async function addRecord(data) {
+            // Önce dokümanı oluştur (ID almak için)
+            const docRef = await addDoc(collection(db, "arizalar"), {
+                ...data,
+                bayiEmail: isAdmin ? (data.bayiEmail || ADMIN_EMAIL) : currentUser.email,
+                tarih: serverTimestamp(),
+                createdAt: new Date().toISOString(),
+                fotoUrls: []
+            });
+
+            // Fotoğraf varsa Storage'a yükle, URL'leri Firestore'a kaydet
+            if (selectedPhotos.length > 0) {
+                const { updateDoc, doc } = await import("https://www.gstatic.com/firebasejs/10.12.2/firebase-firestore.js");
+                const urls = await uploadPhotos(docRef.id);
+                await updateDoc(doc(db, "arizalar", docRef.id), { fotoUrls: urls });
+            }
+
+            selectedPhotos = [];
+            renderPhotoPreview();
+            closeModal("recordModal");
+            await loadRecords();
+        }
+
+        async function addDealer() {
+            const email = document.getElementById("dealerEmail").value.trim();
+            const password = document.getElementById("dealerPassword").value;
+            const errEl = document.getElementById("dealerError");
+            errEl.textContent = "";
+            if (!email || !password) { errEl.textContent = "E-posta ve şifre zorunludur."; return; }
+
+            // Firebase Admin SDK olmadan client-side bayi oluşturulamaz.
+            // Bunun yerine Firestore'a "bayi" dokümanı kaydediyoruz (referans).
+            try {
+                await addDoc(collection(db, "bayiler"), { email, createdAt: new Date().toISOString() });
+                document.getElementById("dealerEmail").value = "";
+                document.getElementById("dealerPassword").value = "";
+                showToast("Bayi kaydedildi! Firebase Console'dan kullanıcı oluşturmayı unutmayın.", "info");
+            } catch (e) {
+                errEl.textContent = "Kayıt hatası: " + e.message;
+            }
+        }
+
+        function renderTable() {
+            const tbody = document.getElementById("recordsBody");
+            if (!tbody) return;
+
+            const now = new Date();
+            const filtered = allRecords.filter(r => {
+                const matchStatus = filterStatus === "all" || r.durum === filterStatus;
+                const term = searchTerm.toLowerCase();
+                const matchSearch = !term ||
+                    (r.musteriAd || "").toLowerCase().includes(term) ||
+                    (r.firmaAdi || "").toLowerCase().includes(term) ||
+                    (r.urunAdi || "").toLowerCase().includes(term) ||
+                    (r.seriNo || "").toLowerCase().includes(term) ||
+                    (r.bayiEmail || "").toLowerCase().includes(term);
+                return matchStatus && matchSearch;
+            });
+
+            // Yönetici için 15 gün geçen açık kayıt sayısı
+            if (isAdmin) {
+                const overdueCount = allRecords.filter(r => {
+                    const ca = r.createdAt ? new Date(r.createdAt) : null;
+                    return ca && r.durum === "Açık" && Math.floor((now - ca) / 86400000) >= 15;
+                }).length;
+                const banner = document.getElementById("overdueBanner");
+                if (banner) {
+                    if (overdueCount > 0) {
+                        banner.textContent = `⚠ ${overdueCount} adet arıza kaydı 15 günü aştı — acil takip gerekiyor!`;
+                        banner.classList.remove("hidden");
+                    } else {
+                        banner.classList.add("hidden");
+                    }
+                }
+            }
+
+            tbody.innerHTML = filtered.length === 0
+                ? `<tr><td colspan="8" class="text-center py-10 text-gray-500 text-sm">Kayıt bulunamadı.</td></tr>`
+                : filtered.map(r => {
+                    const createdAt = r.createdAt ? new Date(r.createdAt) : null;
+                    const daysDiff = createdAt ? Math.floor((now - createdAt) / 86400000) : 0;
+                    // Uyarı YALNIZCA yöneticiye gösterilir
+                    const isOverdue = isAdmin && r.durum === "Açık" && daysDiff >= 15;
+                    const dateStr = createdAt ? createdAt.toLocaleDateString("tr-TR") : "—";
+                    const statusBadge = r.durum === "Açık"
+                        ? `<span class="badge-open">Açık</span>`
+                        : `<span class="badge-closed">Kapalı</span>`;
+                    const warningIcon = isOverdue
+                        ? `<span class="ml-2 text-red-400 font-bold text-xs" title="${daysDiff} gün geçti!">⚠ ${daysDiff} gün</span>`
+                        : "";
+                    const rowClass = isOverdue ? "row-overdue" : "";
+
+                    return `
+              <tr class="record-row ${rowClass}">
+                <td class="px-4 py-3 text-sm text-gray-300">${dateStr}</td>
+                <td class="px-4 py-3 text-sm text-white font-medium">${r.urunAdi || "—"}</td>
+                <td class="px-4 py-3 text-sm text-gray-400 font-mono">${r.seriNo || "—"}</td>
+                <td class="px-4 py-3 text-sm text-gray-300">${r.firmaAdi || "—"}</td>
+                <td class="px-4 py-3 text-sm text-gray-300">${r.musteriAd || "—"}</td>
+                <td class="px-4 py-3 text-sm text-gray-400 max-w-xs truncate" title="${r.arizaSebebi || ""}">${r.arizaSebebi || "—"}</td>
+                <td class="px-4 py-3 text-sm">${statusBadge}${warningIcon}</td>
+                <td class="px-4 py-3">
+                  ${(r.fotoUrls && r.fotoUrls.length > 0)
+                            ? `<div class="flex gap-1 flex-wrap">${r.fotoUrls.map(url =>
+                                `<img src="${url}" class="w-9 h-9 object-cover rounded cursor-pointer border border-gray-700 hover:border-red-500 transition-colors"
+                             onclick="openPhotoViewer('${url}')" title="Büyütmek için tıkla" />`
+                            ).join("")}</div>`
+                            : `<span class="text-gray-700 text-xs">—</span>`}
+                </td>
+                ${isAdmin ? `<td class="px-4 py-3 text-xs text-gray-500">${r.bayiEmail || "—"}</td>` : ""}
+              </tr>`;
+                }).join("");
+
+            document.getElementById("recordCount").textContent = filtered.length + " kayıt";
+        }
+
+        // ════════════════════════════════════════════════
+        //  UI HELPERS
+        // ════════════════════════════════════════════════
+        function showLogin() {
+            document.getElementById("loginScreen").classList.remove("hidden");
+            document.getElementById("dashboard").classList.add("hidden");
+            const savedEmail = localStorage.getItem("rememberedEmail");
+            const savedPassword = localStorage.getItem("rememberedPassword");
+            if (savedEmail) {
+                document.getElementById("loginEmail").value = savedEmail;
+                document.getElementById("rememberMe").checked = true;
+            }
+            if (savedPassword) {
+                document.getElementById("loginPassword").value = savedPassword;
+            }
+        }
+
+        function showDashboard() {
+            document.getElementById("loginScreen").classList.add("hidden");
+            document.getElementById("dashboard").classList.remove("hidden");
+            document.getElementById("userEmail").textContent = currentUser.email;
+            document.getElementById("roleBadge").textContent = isAdmin ? "Yönetici" : "Bayi";
+            document.getElementById("adminPanel").classList.toggle("hidden", !isAdmin);
+            document.getElementById("adminLegend").classList.toggle("hidden", !isAdmin);
+            const thCol = document.getElementById("thBayi");
+            if (thCol) thCol.classList.toggle("hidden", !isAdmin);
+        }
+
+        function openRecordModal() {
+            // Manuel alan temizleme (recordForm bir div olduğundan .reset() çalışmaz)
+            document.getElementById("formError").textContent = "";
+            document.getElementById("formBayiEmail").value = "";
+            document.getElementById("formDate").value = new Date().toISOString().slice(0, 10);
+            document.getElementById("formUrun").value = "";
+            document.getElementById("formSeriNo").value = "";
+            document.getElementById("formFirma").value = "";
+            document.getElementById("formMusteri").value = "";
+            document.getElementById("formTelefon").value = "";
+            document.getElementById("formSebep").value = "";
+            document.getElementById("formDurum").value = "Açık";
+            selectedPhotos = [];
+            renderPhotoPreview();
+            const submitBtn = document.getElementById("submitBtn");
+            submitBtn.disabled = false;
+            submitBtn.textContent = "Kaydet";
+            const bayiRow = document.getElementById("bayiEmailRow");
+            if (bayiRow) bayiRow.classList.toggle("hidden", !isAdmin);
+            openModal("recordModal");
+        }
+
+        function openModal(id) { document.getElementById(id).classList.remove("hidden"); }
+        function closeModal(id) { document.getElementById(id).classList.add("hidden"); }
+
+        function showToast(msg, type = "success") {
+            const t = document.getElementById("toast");
+            t.textContent = msg;
+            t.className = `toast show ${type === "info" ? "toast-info" : "toast-success"}`;
+            setTimeout(() => t.classList.remove("show"), 3500);
+        }
+
+        // ════════════════════════════════════════════════
+        //  FORM SUBMIT
+        // ════════════════════════════════════════════════
+        async function submitRecord() {
+            const errEl = document.getElementById("formError");
+            errEl.textContent = "";
+            const get = id => document.getElementById(id)?.value?.trim() || "";
+            const data = {
+                tarihStr: get("formDate"),
+                urunAdi: get("formUrun"),
+                seriNo: get("formSeriNo"),
+                firmaAdi: get("formFirma"),
+                musteriAd: get("formMusteri"),
+                telefon: get("formTelefon"),
+                arizaSebebi: get("formSebep"),
+                durum: get("formDurum"),
+            };
+            if (isAdmin) data.bayiEmail = get("formBayiEmail") || ADMIN_EMAIL;
+            if (!data.urunAdi || !data.musteriAd || !data.arizaSebebi) {
+                errEl.textContent = "Ürün adı, müşteri adı ve arıza sebebi zorunludur.";
+                return;
+            }
+            const btn = document.getElementById("submitBtn");
+            btn.disabled = true;
+            btn.textContent = selectedPhotos.length > 0 ? "Yükleniyor…" : "Kaydediliyor…";
+            try {
+                await addRecord(data);
+                showToast("Arıza kaydı başarıyla oluşturuldu.");
+            } catch (e) {
+                errEl.textContent = "Kayıt hatası: " + e.message;
+            }
+            btn.disabled = false;
+            btn.textContent = "Kaydet";
+        }
+
+        // ════════════════════════════════════════════════
+        //  GLOBAL EXPORTS (DOM event handlers)
+        // ════════════════════════════════════════════════
+        window.doLogin = doLogin;
+        window.doLogout = doLogout;
+        window.openRecordModal = openRecordModal;
+        window.closeModal = closeModal;
+        window.submitRecord = submitRecord;
+        window.addDealer = addDealer;
+        window.setFilter = (s) => { filterStatus = s; renderTable(); };
+        window.setSearch = (v) => { searchTerm = v; renderTable(); };
+        window.reloadRecords = loadRecords;
+    </script>
+
+    <style>
+        :root {
+            --red: #e02020;
+            --dark: #0a0a0a;
+            --card: #111111;
+            --border: #222222;
+            --text: #f0f0f0;
+        }
+
+        * {
+            box-sizing: border-box;
+        }
+
+        body {
+            font-family: 'Barlow', sans-serif;
+            background: var(--dark);
+            color: var(--text);
+            min-height: 100vh;
+            margin: 0;
+        }
+
+        /* ── Login ─────────────────────────── */
+        #loginScreen {
+            background: radial-gradient(ellipse at 60% 40%, #1a0505 0%, #0a0a0a 70%);
+        }
+
+        .login-card {
+            background: #111;
+            border: 1px solid #2a2a2a;
+            box-shadow: 0 0 60px rgba(224, 32, 32, .15);
+        }
+
+        .login-divider {
+            border-color: #2a2a2a;
+        }
+
+        /* ── Input ─────────────────────────── */
+        .field {
+            background: #181818;
+            border: 1px solid #2e2e2e;
+            border-radius: 6px;
+            color: #f0f0f0;
+            padding: .55rem .8rem;
+            width: 100%;
+            font-family: 'Barlow', sans-serif;
+            font-size: .9rem;
+            transition: border-color .2s;
+        }
+
+        .field:focus {
+            outline: none;
+            border-color: var(--red);
+        }
+
+        .field option {
+            background: #181818;
+        }
+
+        /* ── Buttons ───────────────────────── */
+        .btn-primary {
+            background: var(--red);
+            color: #fff;
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 700;
+            letter-spacing: .05em;
+            text-transform: uppercase;
+            border: none;
+            border-radius: 6px;
+            padding: .65rem 1.4rem;
+            cursor: pointer;
+            transition: background .2s, transform .1s;
+        }
+
+        .btn-primary:hover {
+            background: #c01a1a;
+        }
+
+        .btn-primary:active {
+            transform: scale(.97);
+        }
+
+        .btn-primary:disabled {
+            opacity: .5;
+            cursor: not-allowed;
+        }
+
+        .btn-secondary {
+            background: transparent;
+            color: #aaa;
+            font-family: 'Barlow', sans-serif;
+            font-size: .85rem;
+            border: 1px solid #333;
+            border-radius: 6px;
+            padding: .5rem 1rem;
+            cursor: pointer;
+            transition: border-color .2s, color .2s;
+        }
+
+        .btn-secondary:hover {
+            border-color: #666;
+            color: #ddd;
+        }
+
+        /* ── Header ────────────────────────── */
+        header {
+            background: #0d0d0d;
+            border-bottom: 1px solid var(--border);
+            padding: .75rem 1.5rem;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .logo-slash {
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 800;
+            font-size: 1.5rem;
+            color: var(--red);
+            letter-spacing: -.02em;
+        }
+
+        .logo-proma {
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 800;
+            font-size: 1.5rem;
+            color: #fff;
+            letter-spacing: .02em;
+        }
+
+        .logo-sub {
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 700;
+            font-size: .8rem;
+            color: var(--red);
+            letter-spacing: .12em;
+            text-transform: uppercase;
+            margin-top: -4px;
+        }
+
+        /* ── Cards ─────────────────────────── */
+        .panel-card {
+            background: var(--card);
+            border: 1px solid var(--border);
+            border-radius: 10px;
+        }
+
+        .section-title {
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 700;
+            font-size: 1.1rem;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: #bbb;
+        }
+
+        /* ── Table ─────────────────────────── */
+        table {
+            border-collapse: collapse;
+            width: 100%;
+        }
+
+        thead th {
+            background: #161616;
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 700;
+            font-size: .78rem;
+            letter-spacing: .1em;
+            text-transform: uppercase;
+            color: #666;
+            padding: .7rem 1rem;
+            border-bottom: 1px solid #222;
+            text-align: left;
+            position: sticky;
+            top: 0;
+        }
+
+        .record-row {
+            border-bottom: 1px solid #1a1a1a;
+            transition: background .15s;
+        }
+
+        .record-row:hover {
+            background: #181818;
+        }
+
+        .row-overdue {
+            background: rgba(224, 32, 32, .06) !important;
+        }
+
+        .row-overdue:hover {
+            background: rgba(224, 32, 32, .1) !important;
+        }
+
+        /* ── Badges ────────────────────────── */
+        .badge-open {
+            display: inline-block;
+            background: rgba(239, 68, 68, .15);
+            color: #ef4444;
+            border: 1px solid rgba(239, 68, 68, .3);
+            border-radius: 4px;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .05em;
+            padding: 1px 7px;
+        }
+
+        .badge-closed {
+            display: inline-block;
+            background: rgba(34, 197, 94, .12);
+            color: #4ade80;
+            border: 1px solid rgba(34, 197, 94, .25);
+            border-radius: 4px;
+            font-size: .72rem;
+            font-weight: 700;
+            letter-spacing: .05em;
+            padding: 1px 7px;
+        }
+
+        .role-badge {
+            font-family: 'Barlow Condensed', sans-serif;
+            font-size: .7rem;
+            font-weight: 700;
+            letter-spacing: .1em;
+            text-transform: uppercase;
+            background: rgba(224, 32, 32, .15);
+            color: var(--red);
+            border: 1px solid rgba(224, 32, 32, .3);
+            border-radius: 4px;
+            padding: 2px 8px;
+        }
+
+        /* ── Modal ─────────────────────────── */
+        .modal-overlay {
+            position: fixed;
+            inset: 0;
+            background: rgba(0, 0, 0, .75);
+            backdrop-filter: blur(4px);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            z-index: 50;
+            padding: 1rem;
+        }
+
+        .modal-box {
+            background: #111;
+            border: 1px solid #2a2a2a;
+            border-radius: 12px;
+            width: 100%;
+            max-width: 560px;
+            max-height: 90vh;
+            overflow-y: auto;
+        }
+
+        .modal-header {
+            padding: 1.2rem 1.5rem;
+            border-bottom: 1px solid #222;
+            display: flex;
+            align-items: center;
+            justify-content: space-between;
+        }
+
+        .modal-body {
+            padding: 1.5rem;
+        }
+
+        label.form-label {
+            display: block;
+            font-size: .78rem;
+            font-weight: 600;
+            letter-spacing: .06em;
+            text-transform: uppercase;
+            color: #888;
+            margin-bottom: .3rem;
+        }
+
+        /* ── Filter tabs ───────────────────── */
+        .filter-tab {
+            font-family: 'Barlow Condensed', sans-serif;
+            font-weight: 700;
+            font-size: .8rem;
+            letter-spacing: .08em;
+            text-transform: uppercase;
+            padding: .35rem .9rem;
+            border-radius: 5px;
+            border: 1px solid transparent;
+            cursor: pointer;
+            transition: all .2s;
+            color: #666;
+            background: transparent;
+        }
+
+        .filter-tab:hover {
+            color: #ccc;
+            border-color: #333;
+        }
+
+        .filter-tab.active {
+            color: #fff;
+            background: #222;
+            border-color: #333;
+        }
+
+        /* ── Toast ─────────────────────────── */
+        .toast {
+            position: fixed;
+            bottom: 1.5rem;
+            right: 1.5rem;
+            padding: .75rem 1.2rem;
+            border-radius: 8px;
+            font-size: .9rem;
+            font-weight: 600;
+            max-width: 340px;
+            opacity: 0;
+            transform: translateY(10px);
+            transition: opacity .3s, transform .3s;
+            z-index: 100;
+            pointer-events: none;
+        }
+
+        .toast.show {
+            opacity: 1;
+            transform: translateY(0);
+        }
+
+        .toast-success {
+            background: #14532d;
+            color: #4ade80;
+            border: 1px solid #166534;
+        }
+
+        .toast-info {
+            background: #1e3a5f;
+            color: #60a5fa;
+            border: 1px solid #1d4ed8;
+        }
+
+        /* ── Scrollbar ─────────────────────── */
+        ::-webkit-scrollbar {
+            width: 6px;
+            height: 6px;
+        }
+
+        ::-webkit-scrollbar-track {
+            background: #111;
+        }
+
+        ::-webkit-scrollbar-thumb {
+            background: #333;
+            border-radius: 3px;
+        }
+
+        .hidden {
+            display: none !important;
+        }
+
+        /* ── Checkbox ──────────────────────── */
+        input[type=checkbox] {
+            accent-color: var(--red);
+        }
+    </style>
+</head>
+
+<body>
+
+    <!-- ══════════════════════════════════════════════════
+     LOGIN SCREEN
+══════════════════════════════════════════════════ -->
+    <div id="loginScreen" class="min-h-screen flex items-center justify-center p-4">
+        <div class="login-card rounded-2xl p-8 w-full max-w-sm">
+
+            <!-- Logo -->
+            <div class="flex flex-col items-center mb-8">
+                <div class="flex items-center gap-1">
+                    <span class="logo-slash">///</span>
+                    <span class="logo-proma">PROMA</span>
+                </div>
+                <div class="logo-sub">Güvenlik</div>
+                <div class="mt-3 text-xs text-gray-600 tracking-widest uppercase">Arıza Takip Sistemi</div>
+            </div>
+
+            <!-- Tabs -->
+            <div class="flex gap-2 mb-6">
+                <button class="filter-tab active flex-1 text-center" id="tabAdmin">Yönetici Girişi</button>
+                <button class="filter-tab flex-1 text-center" id="tabDealer">Bayi Girişi</button>
+            </div>
+
+            <div class="space-y-4">
+                <div>
+                    <label class="form-label">E-posta</label>
+                    <input id="loginEmail" type="email" class="field" placeholder="ornek@mail.com"
+                        onkeydown="if(event.key==='Enter')doLogin()" />
+                </div>
+                <div>
+                    <label class="form-label">Şifre</label>
+                    <input id="loginPassword" type="password" class="field" placeholder="••••••••"
+                        onkeydown="if(event.key==='Enter')doLogin()" />
+                </div>
+                <div class="flex items-center gap-2">
+                    <input type="checkbox" id="rememberMe" class="w-4 h-4" />
+                    <label for="rememberMe" class="text-sm text-gray-400 select-none cursor-pointer">E-posta ve Şifreyi
+                        Hatırla</label>
+                </div>
+                <p id="loginError" class="text-red-500 text-sm min-h-[1.2rem]"></p>
+                <button onclick="doLogin()" class="btn-primary w-full py-3 text-base">Giriş Yap</button>
+            </div>
+        </div>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+     DASHBOARD
+══════════════════════════════════════════════════ -->
+    <div id="dashboard" class="hidden flex flex-col min-h-screen">
+
+        <!-- Header -->
+        <header>
+            <div>
+                <div class="flex items-center gap-1">
+                    <span class="logo-slash text-xl">///</span>
+                    <span class="logo-proma text-xl">PROMA</span>
+                </div>
+                <div class="logo-sub text-xs">Güvenlik · Arıza Takip</div>
+            </div>
+            <div class="flex items-center gap-3">
+                <span id="roleBadge" class="role-badge">Bayi</span>
+                <span id="userEmail" class="text-xs text-gray-500 hidden sm:inline"></span>
+                <button onclick="doLogout()" class="btn-secondary text-sm">Çıkış</button>
+            </div>
+        </header>
+
+        <main class="flex-1 p-4 md:p-6 max-w-7xl mx-auto w-full space-y-5">
+
+            <!-- ── OVERDUE BANNER (sadece yönetici) ── -->
+            <div id="overdueBanner" class="hidden rounded-lg px-4 py-3 text-sm font-semibold flex items-center gap-2"
+                style="background:rgba(224,32,32,.12);border:1px solid rgba(224,32,32,.35);color:#f87171;">
+            </div>
+
+            <!-- ── ADMIN PANEL ───────────────────── -->
+            <div id="adminPanel" class="panel-card p-5 hidden">
+                <div class="section-title mb-4">⚙ Bayi Yönetimi</div>
+                <div class="grid grid-cols-1 sm:grid-cols-3 gap-3">
+                    <div>
+                        <label class="form-label">Bayi E-postası</label>
+                        <input id="dealerEmail" type="email" class="field" placeholder="bayi@mail.com" />
+                    </div>
+                    <div>
+                        <label class="form-label">Şifre</label>
+                        <input id="dealerPassword" type="password" class="field" placeholder="En az 6 karakter" />
+                    </div>
+                    <div class="flex items-end">
+                        <button onclick="addDealer()" class="btn-primary w-full">Bayi Ekle</button>
+                    </div>
+                </div>
+                <p id="dealerError" class="text-red-500 text-xs mt-2 min-h-[1rem]"></p>
+                <p class="text-yellow-600 text-xs mt-1">⚠ Bayiyi Firestore'a kaydettikten sonra Firebase Console →
+                    Authentication'dan da kullanıcı oluşturmayı unutmayın.</p>
+            </div>
+
+            <!-- ── RECORDS PANEL ─────────────────── -->
+            <div class="panel-card">
+                <!-- Toolbar -->
+                <div
+                    class="flex flex-col sm:flex-row gap-3 items-start sm:items-center justify-between p-4 border-b border-gray-800">
+                    <div class="flex items-center gap-2 flex-wrap">
+                        <button class="filter-tab active" id="fAll"
+                            onclick="setFilter('all');setActiveFilter('fAll')">Tümü</button>
+                        <button class="filter-tab" id="fOpen"
+                            onclick="setFilter('Açık');setActiveFilter('fOpen')">Açık</button>
+                        <button class="filter-tab" id="fClosed"
+                            onclick="setFilter('Kapalı');setActiveFilter('fClosed')">Kapalı</button>
+                        <span id="recordCount" class="text-xs text-gray-600 ml-2"></span>
+                    </div>
+                    <div class="flex items-center gap-2 w-full sm:w-auto">
+                        <input type="search" placeholder="Ara…" class="field text-sm" style="max-width:220px"
+                            oninput="setSearch(this.value)" />
+                        <button onclick="reloadRecords()" class="btn-secondary text-sm px-3" title="Yenile">↻</button>
+                        <button onclick="openRecordModal()" class="btn-primary text-sm px-4">+ Yeni Arıza</button>
+                    </div>
+                </div>
+
+                <!-- Table -->
+                <div class="overflow-x-auto">
+                    <table>
+                        <thead>
+                            <tr>
+                                <th>Tarih</th>
+                                <th>Ürün</th>
+                                <th>Seri No</th>
+                                <th>Firma</th>
+                                <th>Müşteri</th>
+                                <th>Arıza Sebebi</th>
+                                <th>Durum</th>
+                                <th>Fotoğraf</th>
+                                <th id="thBayi" class="hidden">Bayi</th>
+                            </tr>
+                        </thead>
+                        <tbody id="recordsBody">
+                            <tr>
+                                <td colspan="8" class="text-center py-10 text-gray-600 text-sm">Yükleniyor…</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </div>
+
+            <!-- Legend (admin only) -->
+            <div id="adminLegend" class="hidden text-xs text-gray-600 flex items-center gap-2">
+                <span class="text-red-500 font-bold">⚠</span>
+                <span>Kırmızı uyarı: Kayıt tarihinden itibaren 15 gün geçmiş ve durumu Açık olan arızaları gösterir
+                    (yalnızca yönetici görür). &nbsp;|&nbsp; Fotoğraflar Firebase Storage'a yüklenir — Storage
+                    kurallarını etkinleştirmeyi unutmayın.</span>
+            </div>
+
+        </main>
+    </div>
+
+    <!-- ══════════════════════════════════════════════════
+     RECORD MODAL
+══════════════════════════════════════════════════ -->
+    <div id="recordModal" class="modal-overlay hidden" onclick="if(event.target===this)closeModal('recordModal')">
+        <div class="modal-box">
+            <div class="modal-header">
+                <span class="section-title">Yeni Arıza Kaydı</span>
+                <button onclick="closeModal('recordModal')"
+                    class="text-gray-500 hover:text-white text-xl leading-none">✕</button>
+            </div>
+            <div class="modal-body space-y-4" id="recordForm">
+
+                <!-- Bayi Email (sadece admin) -->
+                <div id="bayiEmailRow" class="hidden">
+                    <label class="form-label">Bayi E-postası (isteğe bağlı)</label>
+                    <input id="formBayiEmail" type="email" class="field" placeholder="bayi@mail.com" />
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="form-label">Tarih *</label>
+                        <input id="formDate" type="date" class="field" />
+                    </div>
+                    <div>
+                        <label class="form-label">Ürün Adı *</label>
+                        <input id="formUrun" type="text" class="field" placeholder="Kamera, NVR…" />
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="form-label">Seri No</label>
+                        <input id="formSeriNo" type="text" class="field" placeholder="SN-XXXX" />
+                    </div>
+                    <div>
+                        <label class="form-label">Firma Adı</label>
+                        <input id="formFirma" type="text" class="field" placeholder="Firma Bilgisi" />
+                    </div>
+                </div>
+
+                <div class="grid grid-cols-2 gap-3">
+                    <div>
+                        <label class="form-label">Müşteri Adı Soyadı *</label>
+                        <input id="formMusteri" type="text" class="field" placeholder="Ad Soyad" />
+                    </div>
+                    <div>
+                        <label class="form-label">Telefon</label>
+                        <input id="formTelefon" type="tel" class="field" placeholder="05xx xxx xx xx" />
+                    </div>
+                </div>
+
+                <div>
+                    <label class="form-label">Arıza Sebebi *</label>
+                    <select id="formSebep" class="field">
+                        <option value="">Seçiniz…</option>
+                        <option>Görüntü Kaybı / No Video</option>
+                        <option>Gece Görüş Sorunu</option>
+                        <option>Kayıt Sorunu</option>
+                        <option>Zoom Hatası</option>
+                        <option>Yazılım Şifre Sorunu</option>
+                        <option>Adaptör / Enerji Sorunu</option>
+                    </select>
+                </div>
+
+                <div>
+                    <label class="form-label">Durum</label>
+                    <select id="formDurum" class="field">
+                        <option value="Açık">Açık</option>
+                        <option value="Kapalı">Kapalı</option>
+                    </select>
+                </div>
+
+                <!-- Fotoğraf yükleme -->
+                <div>
+                    <label class="form-label">Fotoğraf <span class="text-gray-600 normal-case font-normal">(isteğe
+                            bağlı, en fazla 5)</span></label>
+                    <div id="photoPreview" class="flex flex-wrap gap-2 mt-1">
+                        <!-- JS ile doldurulur -->
+                    </div>
+                </div>
+
+                <p id="formError" class="text-red-500 text-sm min-h-[1rem]"></p>
+
+                <div class="flex gap-3 pt-2">
+                    <button onclick="closeModal('recordModal')" class="btn-secondary flex-1">İptal</button>
+                    <button id="submitBtn" onclick="submitRecord()" class="btn-primary flex-1">Kaydet</button>
+                </div>
+            </div>
+        </div>
+    </div>
+
+    <!-- Toast -->
+    <div id="toast" class="toast"></div>
+
+    <!-- Photo Viewer Lightbox -->
+    <div id="photoViewer" class="hidden"
+        style="position:fixed;inset:0;background:rgba(0,0,0,.92);z-index:200;display:none;align-items:center;justify-content:center;padding:1rem;"
+        onclick="this.style.display='none';this.classList.add('hidden')">
+        <div style="position:relative;max-width:90vw;max-height:90vh;">
+            <img id="photoViewerImg" src=""
+                style="max-width:100%;max-height:85vh;border-radius:8px;box-shadow:0 0 60px rgba(0,0,0,.8);" />
+            <button
+                onclick="document.getElementById('photoViewer').style.display='none';document.getElementById('photoViewer').classList.add('hidden')"
+                style="position:absolute;top:-14px;right:-14px;width:32px;height:32px;border-radius:50%;background:#e02020;color:#fff;border:none;font-size:1rem;cursor:pointer;display:flex;align-items:center;justify-content:center;line-height:1;">✕</button>
+        </div>
+    </div>
+
+    <script>
+        // Tab toggle
+        function setActiveFilter(id) {
+            ["fAll", "fOpen", "fClosed"].forEach(t => {
+                const el = document.getElementById(t);
+                if (el) el.classList.toggle("active", t === id);
+            });
+        }
+
+        // Tab ui on login screen
+        const tabs = { tabAdmin: 0, tabDealer: 1 };
+        Object.keys(tabs).forEach(id => {
+            const el = document.getElementById(id);
+            if (!el) return;
+            el.addEventListener("click", () => {
+                Object.keys(tabs).forEach(t => document.getElementById(t).classList.remove("active"));
+                el.classList.add("active");
+            });
+        });
+    </script>
+</body>
+
+</html>
